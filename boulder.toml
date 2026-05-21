@@ -1,0 +1,7 @@
+[project]
+name = "sisypy"
+description = "One must imagine the test suite happy."
+
+[defaults]
+evidence_dir = "out/sisypy"
+config_name = "boulder.toml"
