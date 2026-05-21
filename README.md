@@ -1,7 +1,5 @@
 # Sisypy
 
-One must imagine the test suite happy.
-
 Programmatic tests check whether code behaves correctly when called correctly. Sisypy checks whether an agent, given only what a real user would provide, can discover the right path, act safely, produce evidence, and fulfill both the product's purpose and the user's purpose.
 
 Sisypy is a scenario-based evaluation harness for agentic software work. It runs user-shaped tasks against a codebase, freezes evidence, assesses claims against what actually happened, and separates actor failures, harness uncertainty, and legitimate product blockers.
