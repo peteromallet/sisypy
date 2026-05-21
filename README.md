@@ -1,6 +1,4 @@
-# Sisypy Agentic Testing
-
-A toolkit for designing, running, and assessing agent performance.
+# Sisypy: a toolkit for testing and tracking agent performance
 
 ![Sisypy agentic testing loop](docs/assets/sisypy-agentic-testing.png)
 
