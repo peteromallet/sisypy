@@ -1,4 +1,4 @@
-# Sisypy: a toolkit for testing and tracking agent performance
+# Sisypy: a toolkit for testing & tracking agent performance
 
 ![Sisypy agentic testing loop](docs/assets/sisypy-agentic-testing.png)
 
