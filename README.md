@@ -1,4 +1,8 @@
-# Sisypy
+# Sisypy Agentic Testing
+
+A toolkit for designing, running, and assessing agent performance.
+
+![Sisypy agentic testing loop](docs/assets/sisypy-agentic-testing.png)
 
 Programmatic tests check whether code behaves correctly when called correctly. Sisypy checks whether an agent, given only what a real user would provide, can discover the right path, act safely, produce evidence, and fulfill both the product's purpose and the user's purpose.
 
