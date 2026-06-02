@@ -1491,11 +1491,11 @@ def run_all(
         if ss.get("error"):
             batch_has_blocked_or_error = True
         else:
-            for rr in ss.get("runs", []):
-                outcome = rr.get("outcome", "")
+            for run_rec in ss.get("runs", []):
+                outcome = run_rec.get("outcome", "")
                 if outcome in ("blocked_prerequisite", "skipped_live"):
                     batch_has_blocked_or_error = True
-                elif rr.get("errors") or ss.get("error"):
+                elif run_rec.get("errors") or ss.get("error"):
                     batch_has_blocked_or_error = True
 
     # --- Write batch summary ---

@@ -26,8 +26,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
+import sys
+import tempfile
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +55,13 @@ DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
 DEFAULT_MAX_TOKENS = 16000
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_TIMEOUT_SEC = 300
+
+# Agentic assessor config.  The model name intentionally includes the provider
+# prefix expected by subagent-launcher, unlike the legacy chat-completions model.
+DEFAULT_AGENT_MODEL = "deepseek:deepseek-v4-pro"
+DEFAULT_AGENT_TOOLSETS = "file,terminal"
+DEFAULT_AGENT_MAX_TOKENS = 32768
+DEFAULT_AGENT_TIMEOUT_SEC = 2400
 
 # Retry configuration.
 MAX_RETRIES = 3
@@ -480,6 +489,248 @@ def _parse_assessor_response(raw: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Agentic assessor
+# ---------------------------------------------------------------------------
+
+
+def _default_launcher_path() -> Path:
+    return Path.home() / ".claude" / "skills" / "subagent-launcher" / "launch_hermes_agent.py"
+
+
+def _resolve_assessor_launcher() -> Path | None:
+    raw = os.environ.get("SISYPY_ASSESSOR_LAUNCHER")
+    launcher = Path(raw).expanduser() if raw else _default_launcher_path()
+    return launcher if launcher.is_file() else None
+
+
+def _build_agent_assessor_brief(evidence_pack: EvidencePack, scenario: Scenario) -> str:
+    evidence_dir = Path(evidence_pack.evidence_dir).resolve()
+    rubric_text = _assemble_rubric(scenario.assessment)
+
+    manifest_summary = ""
+    if evidence_pack.manifest:
+        manifest_summary = json.dumps(evidence_pack.manifest, indent=2, sort_keys=True)
+
+    capture_gaps = ""
+    if evidence_pack.capture_gaps:
+        capture_gaps = json.dumps(evidence_pack.capture_gaps, indent=2, sort_keys=True)
+
+    return f"""\
+You are the Sisypy assessor. Your current working directory is the frozen
+evidence pack:
+
+{evidence_dir}
+
+Assess the run against the hidden rubric below. The evidence pack, not the
+actor's report alone, is the only source of truth.
+
+## Hidden Rubric
+
+{rubric_text}
+
+## Evidence Pack Orientation
+
+Open and parse the actual files in this directory. Do not rely on a summarized
+or truncated snippet. Check files such as:
+
+- compiled_api.json and any project_specific/**/compiled_api.json copies
+- metadata.json and manifest.json
+- actions.jsonl and command_log.jsonl
+- report.md
+- stdout.log and stderr.log
+- git_diff.patch
+- tree_before.txt and tree_after.txt
+- command sidecars under commands/
+
+Manifest, if available:
+
+{manifest_summary or "(none)"}
+
+Capture gaps, if available:
+
+{capture_gaps or "(none)"}
+
+## Required Method
+
+1. Verify every enforced, graded, and observed rubric item against real bytes
+   from the frozen evidence pack.
+2. Use file reads plus grep/python as needed. For JSON artifacts, load the JSON
+   and assert exact facts instead of eyeballing prose.
+3. For structural "compiles but wrong" checks, actually inspect compiled graph
+   fields: node ids, class_type values, and exact inputs.<field> references such
+   as ["48", 0]. Confirm whether removed nodes are absent and consumers are
+   rewired as required.
+4. For action/process claims, inspect actions.jsonl, command_log.jsonl, stdout,
+   stderr, command sidecars, and report.md for supporting or contradictory
+   evidence.
+
+## Rules
+
+- Evidence over narrative. A report claim is not enough unless the files support it.
+- READ ONLY. Never modify, create, delete, or rewrite files in the evidence pack.
+- If a check cannot be proven from the files, mark that item undetermined or not
+  passed. Never assume success.
+- If evidence contradicts the actor's claims, record the contradiction.
+- Keep reasoning concise but cite the concrete files/fields examined.
+- Output ONLY valid JSON. No markdown, no code fences, no commentary.
+
+## Output Schema
+
+Return exactly this JSON shape:
+
+{{
+  "overall_passed": true/false,
+  "summary": "one-line result summary",
+  "verdicts": {{
+    "enforced": [
+      {{"item": "...", "passed": true/false, "reasoning": "..."}}
+    ],
+    "graded": [
+      {{"item": "...", "passed": true/false, "score": 0-100, "reasoning": "..."}}
+    ],
+    "observed": [
+      {{"item": "...", "note": "..."}}
+    ]
+  }},
+  "contradictions": [
+    "description of any claim that contradicts the evidence"
+  ],
+  "strengths": ["notable positive findings"],
+  "weaknesses": ["areas for improvement"],
+  "undetermined": false,
+  "undetermined_items": []
+}}
+
+When an item is undetermined, include evidence_checked and missing_capture for
+that item and list it in undetermined_items. If any item is undetermined,
+overall_passed must be false.
+"""
+
+
+def _normalize_assessor_result(
+    parsed: dict[str, Any],
+    *,
+    model: str,
+    elapsed: float,
+    error: str = "",
+) -> dict[str, Any]:
+    undetermined = parsed.get("undetermined", False)
+    if not isinstance(undetermined, bool):
+        undetermined = False
+
+    undetermined_items = parsed.get("undetermined_items", [])
+    if not isinstance(undetermined_items, list):
+        undetermined_items = []
+
+    verdicts = parsed.get("verdicts", {"enforced": [], "graded": [], "observed": []})
+    if not isinstance(verdicts, dict):
+        verdicts = {"enforced": [], "graded": [], "observed": []}
+    verdicts.setdefault("enforced", [])
+    verdicts.setdefault("graded", [])
+    verdicts.setdefault("observed", [])
+
+    return {
+        "ungraded": False,
+        "model": model,
+        "overall_passed": bool(parsed.get("overall_passed", False)),
+        "summary": parsed.get("summary", "Assessment complete."),
+        "verdicts": verdicts,
+        "contradictions": parsed.get("contradictions", []),
+        "strengths": parsed.get("strengths", []),
+        "weaknesses": parsed.get("weaknesses", []),
+        "elapsed_sec": elapsed,
+        "error": error,
+        "undetermined": undetermined,
+        "undetermined_items": undetermined_items,
+    }
+
+
+def _agent_parse_failed(parsed: dict[str, Any]) -> bool:
+    return bool(parsed.get("_raw_response")) and parsed.get("summary") == "Failed to parse assessor response."
+
+
+def _assess_with_agent(
+    evidence_pack: EvidencePack,
+    scenario: Scenario,
+    *,
+    model: str = DEFAULT_AGENT_MODEL,
+    timeout_sec: int = DEFAULT_AGENT_TIMEOUT_SEC,
+    toolsets: str = DEFAULT_AGENT_TOOLSETS,
+    max_tokens: int = DEFAULT_AGENT_MAX_TOKENS,
+) -> dict[str, Any] | None:
+    """Assess by launching a read-only exploring subagent over the evidence dir.
+
+    Returns None for any launcher, runtime, empty-output, or parse problem so the
+    caller can fall back to the legacy single-shot LLM path.
+    """
+    launcher = _resolve_assessor_launcher()
+    if launcher is None:
+        return None
+
+    evidence_dir = Path(evidence_pack.evidence_dir).resolve()
+    if not evidence_dir.is_dir():
+        return None
+
+    t0 = time.monotonic()
+    prompt_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            suffix=".md",
+            prefix="sisypy-assessor-",
+            delete=False,
+        ) as fp:
+            fp.write(_build_agent_assessor_brief(evidence_pack, scenario))
+            prompt_path = Path(fp.name)
+
+        cmd = [
+            sys.executable,
+            str(launcher),
+            "--model",
+            model,
+            "--toolsets",
+            toolsets,
+            "--query_file",
+            str(prompt_path),
+            "--max_tokens",
+            str(max_tokens),
+            "--project_dir",
+            str(evidence_dir),
+        ]
+
+        proc_env = os.environ.copy()
+        proc_env.setdefault("PYENV_VERSION", "3.11.11")
+
+        completed = subprocess.run(
+            cmd,
+            cwd=str(evidence_dir),
+            env=proc_env,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+        )
+        elapsed = round(time.monotonic() - t0, 3)
+        stdout = completed.stdout.strip()
+        if completed.returncode != 0 or not stdout:
+            return None
+
+        parsed = _parse_assessor_response(stdout)
+        if _agent_parse_failed(parsed):
+            return None
+
+        return _normalize_assessor_result(parsed, model=model, elapsed=elapsed)
+    except Exception:
+        return None
+    finally:
+        if prompt_path is not None:
+            try:
+                prompt_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # Main assess entry point
 # ---------------------------------------------------------------------------
 
@@ -502,18 +753,21 @@ def assess(
     tree_cap: int = DEFAULT_TREE_BYTE_CAP,
     diff_cap: int = DEFAULT_DIFF_BYTE_CAP,
 ) -> dict[str, Any]:
-    """Run the LLM rubric grader against a frozen evidence pack.
+    """Run the rubric grader against a frozen evidence pack.
 
     This is the main entry point.  It:
 
-    1. Sources DEEPSEEK_API_KEY from env or ~/.hermes/.env.
-    2. Returns *ungraded* result if key is missing (no crash).
-    3. Assembles evidence sections from ONLY the frozen evidence pack,
+    1. Tries the exploring-agent assessor by default.
+    2. Falls back to the legacy single-shot LLM assessor when forced by
+       SISYPY_ASSESSOR=llm or when the agent path cannot run.
+    3. Sources DEEPSEEK_API_KEY from env or ~/.hermes/.env for the legacy path.
+    4. Returns *ungraded* result if no assessor can run (no crash).
+    5. Assembles evidence sections from ONLY the frozen evidence pack,
        capping each segment to a byte budget.
-    4. Constructs the hidden rubric from scenario.assessment.
-    5. Dispatches the assessor prompt via DeepSeek V4 Pro with retry.
-    6. Parses the structured JSON response.
-    7. Returns a complete result dict.
+    6. Constructs the hidden rubric from scenario.assessment.
+    7. Dispatches the assessor prompt via DeepSeek V4 Pro with retry.
+    8. Parses the structured JSON response.
+    9. Returns a complete result dict.
 
     Args:
         evidence_pack: The frozen EvidencePack to grade.
@@ -536,12 +790,32 @@ def assess(
             contradictions: list     — detected contradictions.
             strengths: list          — notable positives.
             weaknesses: list         — areas for improvement.
-            elapsed_sec: float       — wall-clock time for the LLM call.
-            error: str (optional)    — error message if applicable.
+            elapsed_sec: float       — wall-clock time for the assessor call.
+            error: str               — error message, empty on success.
     """
     t0 = time.monotonic()
 
-    # 1. Key sourcing.
+    assessor_mode = os.environ.get("SISYPY_ASSESSOR", "agent").strip().lower()
+    if assessor_mode not in {"agent", "llm"}:
+        assessor_mode = "agent"
+
+    if assessor_mode == "agent":
+        agent_model = os.environ.get("SISYPY_ASSESSOR_MODEL", DEFAULT_AGENT_MODEL)
+        try:
+            agent_timeout = int(os.environ.get("SISYPY_ASSESSOR_TIMEOUT_SEC", DEFAULT_AGENT_TIMEOUT_SEC))
+        except ValueError:
+            agent_timeout = DEFAULT_AGENT_TIMEOUT_SEC
+
+        agent_result = _assess_with_agent(
+            evidence_pack,
+            scenario,
+            model=agent_model,
+            timeout_sec=agent_timeout,
+        )
+        if agent_result is not None:
+            return agent_result
+
+    # 1. Key sourcing for the legacy single-shot path.
     api_key = _load_deepseek_api_key()
     if not api_key:
         result = _ungraded_result("DEEPSEEK_API_KEY not found in env or ~/.hermes/.env")
@@ -595,26 +869,5 @@ def assess(
     # 6. Parse the response.
     parsed = _parse_assessor_response(response_text)
 
-    # 7. Normalize undetermined fields (handle old assessor outputs that lack them).
-    undetermined = parsed.get("undetermined", False)
-    if not isinstance(undetermined, bool):
-        undetermined = False
-    undetermined_items = parsed.get("undetermined_items", [])
-    if not isinstance(undetermined_items, list):
-        undetermined_items = []
-
-    # 8. Build the final result.
-    return {
-        "ungraded": False,
-        "model": model,
-        "overall_passed": parsed.get("overall_passed", False),
-        "summary": parsed.get("summary", "Assessment complete."),
-        "verdicts": parsed.get("verdicts", {"enforced": [], "graded": [], "observed": []}),
-        "contradictions": parsed.get("contradictions", []),
-        "strengths": parsed.get("strengths", []),
-        "weaknesses": parsed.get("weaknesses", []),
-        "elapsed_sec": elapsed,
-        "_assessor_ts": datetime.now(timezone.utc).isoformat(),
-        "undetermined": undetermined,
-        "undetermined_items": undetermined_items,
-    }
+    # 7. Normalize and build the final result.
+    return _normalize_assessor_result(parsed, model=model, elapsed=elapsed)
